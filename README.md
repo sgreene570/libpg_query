@@ -239,6 +239,23 @@ Each major version is maintained in a dedicated git branch. Only the latest Post
 | 9.5                      | 9.5-latest | No longer supported |
 | 9.4                      | 9.4-latest | No longer supported |
 
+## Upgrading Postgres Major version
+
+The `extract_source.rb` script in `scripts/` can be used to "bump" the postgres version
+used in this reposity.
+
+Prequisites (osx M1):
+
+```bash
+gem install --user-install ffi -- --enable-libffi-alloc
+```
+
+To fetch a postgres tarball and run the script, set the desired PG version in `Makefile` and run:
+
+```bash
+make extract_source
+```
+
 ## Resources
 
 pg_query wrappers in other languages:
