@@ -1,8 +1,5 @@
 /*--------------------------------------------------------------------
  * Symbols referenced in this file:
- * - bms_copy
- * - bms_equal
- * - bms_is_empty
  * - bms_first_member
  * - bms_free
  * - bms_next_member
@@ -23,7 +20,7 @@
  * bms_is_empty() in preference to testing for NULL.)
  *
  *
- * Copyright (c) 2003-2020, PostgreSQL Global Development Group
+ * Copyright (c) 2003-2021, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/nodes/bitmapset.c
@@ -82,19 +79,7 @@
 /*
  * bms_copy - make a palloc'd copy of a bitmapset
  */
-Bitmapset *
-bms_copy(const Bitmapset *a)
-{
-	Bitmapset  *result;
-	size_t		size;
 
-	if (a == NULL)
-		return NULL;
-	size = BITMAPSET_SIZE(a->nwords);
-	result = (Bitmapset *) palloc(size);
-	memcpy(result, a, size);
-	return result;
-}
 
 /*
  * bms_equal - are two bitmapsets equal?
@@ -102,50 +87,7 @@ bms_copy(const Bitmapset *a)
  * This is logical not physical equality; in particular, a NULL pointer will
  * be reported as equal to a palloc'd value containing no members.
  */
-bool
-bms_equal(const Bitmapset *a, const Bitmapset *b)
-{
-	const Bitmapset *shorter;
-	const Bitmapset *longer;
-	int			shortlen;
-	int			longlen;
-	int			i;
 
-	/* Handle cases where either input is NULL */
-	if (a == NULL)
-	{
-		if (b == NULL)
-			return true;
-		return bms_is_empty(b);
-	}
-	else if (b == NULL)
-		return bms_is_empty(a);
-	/* Identify shorter and longer input */
-	if (a->nwords <= b->nwords)
-	{
-		shorter = a;
-		longer = b;
-	}
-	else
-	{
-		shorter = b;
-		longer = a;
-	}
-	/* And process */
-	shortlen = shorter->nwords;
-	for (i = 0; i < shortlen; i++)
-	{
-		if (shorter->words[i] != longer->words[i])
-			return false;
-	}
-	longlen = longer->nwords;
-	for (; i < longlen; i++)
-	{
-		if (longer->words[i] != 0)
-			return false;
-	}
-	return true;
-}
 
 /*
  * bms_compare - qsort-style comparator for bitmapsets
@@ -233,6 +175,8 @@ bms_free(Bitmapset *a)
 
 /*
  * bms_nonempty_difference - do sets have a nonempty difference?
+ *
+ * i.e., are any members set in 'a' that are not also set in 'b'.
  */
 
 
@@ -292,24 +236,7 @@ bms_num_members(const Bitmapset *a)
  *
  * This is even faster than bms_membership().
  */
-bool
-bms_is_empty(const Bitmapset *a)
-{
-	int			nwords;
-	int			wordnum;
 
-	if (a == NULL)
-		return true;
-	nwords = a->nwords;
-	for (wordnum = 0; wordnum < nwords; wordnum++)
-	{
-		bitmapword	w = a->words[wordnum];
-
-		if (w != 0)
-			return false;
-	}
-	return true;
-}
 
 
 /*

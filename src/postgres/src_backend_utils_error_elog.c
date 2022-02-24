@@ -1,36 +1,5 @@
 /*--------------------------------------------------------------------
  * Symbols referenced in this file:
- * - errstart
- * - PG_exception_stack
- * - write_stderr
- * - err_gettext
- * - in_error_recursion_trouble
- * - error_context_stack
- * - errordata_stack_depth
- * - errordata
- * - is_log_level_output
- * - recursion_depth
- * - errmsg_internal
- * - errcode
- * - errmsg
- * - errdetail
- * - errfinish
- * - pg_re_throw
- * - EmitErrorReport
- * - emit_log_hook
- * - send_message_to_server_log
- * - send_message_to_frontend
- * - matches_backtrace_functions
- * - set_backtrace
- * - geterrcode
- * - errhint
- * - errposition
- * - internalerrposition
- * - internalerrquery
- * - geterrposition
- * - getinternalerrposition
- * - set_errcontext_domain
- * - errcontext_msg
  * - CopyErrorData
  * - FlushErrorState
  *--------------------------------------------------------------------
@@ -81,7 +50,7 @@
  * overflow.)
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -110,6 +79,7 @@
 #include "libpq/pqformat.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/postmaster.h"
 #include "postmaster/syslogger.h"
@@ -127,10 +97,8 @@
 
 
 /* Global variables */
-__thread ErrorContextCallback *error_context_stack = NULL;
 
 
-__thread sigjmp_buf *PG_exception_stack = NULL;
 
 
 extern bool redirection_done;
@@ -142,7 +110,6 @@ extern bool redirection_done;
  * libraries will miss any log messages that are generated before the
  * library is loaded.
  */
-__thread emit_log_hook_type emit_log_hook = NULL;
 
 
 /* GUC parameters */
@@ -182,13 +149,10 @@ static void write_eventlog(int level, const char *line, int len);
 /* We provide a small stack of ErrorData records for re-entrant cases */
 #define ERRORDATA_STACK_SIZE  5
 
-static __thread ErrorData errordata[ERRORDATA_STACK_SIZE];
 
 
-static __thread int	errordata_stack_depth = -1;
  /* index of topmost active frame */
 
-static __thread int	recursion_depth = 0;
 	/* to detect actual recursion */
 
 /*
@@ -228,7 +192,43 @@ static void write_pipe_chunks(char *data, int len, int dest);
 static void send_message_to_frontend(ErrorData *edata);
 static const char *error_severity(int elevel);
 static void append_with_tabs(StringInfo buf, const char *str);
-static bool is_log_level_output(int elevel, int log_min_level);
+
+
+/*
+ * is_log_level_output -- is elevel logically >= log_min_level?
+ *
+ * We use this for tests that should consider LOG to sort out-of-order,
+ * between ERROR and FATAL.  Generally this is the right thing for testing
+ * whether a message should go to the postmaster log, whereas a simple >=
+ * test is correct for testing whether the message should go to the client.
+ */
+
+
+/*
+ * Policy-setting subroutines.  These are fairly simple, but it seems wise
+ * to have the code in just one place.
+ */
+
+/*
+ * should_output_to_server --- should message of given elevel go to the log?
+ */
+
+
+/*
+ * should_output_to_client --- should message of given elevel go to the client?
+ */
+
+
+
+/*
+ * message_level_is_interesting --- would ereport/elog do anything?
+ *
+ * Returns true if ereport/elog with this elevel will not be a no-op.
+ * This is useful to short-circuit any expensive preparatory work that
+ * might be needed for a logging message.  There is no point in
+ * prepending this to a bare ereport/elog call, however.
+ */
+
 
 
 /*
@@ -238,30 +238,25 @@ static bool is_log_level_output(int elevel, int log_min_level);
  * that we take if we think we are facing infinite error recursion.  See the
  * callers for details.
  */
-bool
-in_error_recursion_trouble(void)
-{
-	/* Pull the plug if recurse more than once */
-	return (recursion_depth > 2);
-}
+
 
 /*
  * One of those fallback steps is to stop trying to localize the error
  * message, since there's a significant probability that that's exactly
  * what's causing the recursion.
  */
-static inline const char *
-err_gettext(const char *str)
-{
 #ifdef ENABLE_NLS
-	if (in_error_recursion_trouble())
-		return str;
-	else
-		return gettext(str);
 #else
-	return str;
 #endif
-}
+
+/*
+ * errstart_cold
+ *		A simple wrapper around errstart, but hinted to be "cold".  Supporting
+ *		compilers are more likely to move code for branches containing this
+ *		function into an area away from the calling function's code.  This can
+ *		result in more commonly executed code being more compact and fitting
+ *		on fewer cache lines.
+ */
 
 
 /*
@@ -274,189 +269,13 @@ err_gettext(const char *str)
  * Returns true in normal case.  Returns false to short-circuit the error
  * report (if it's a warning or lower and not to be reported anywhere).
  */
-bool
-errstart(int elevel, const char *domain)
-{
-	ErrorData  *edata;
-	bool		output_to_server;
-	bool		output_to_client = false;
-	int			i;
 
-	/*
-	 * Check some cases in which we want to promote an error into a more
-	 * severe error.  None of this logic applies for non-error messages.
-	 */
-	if (elevel >= ERROR)
-	{
-		/*
-		 * If we are inside a critical section, all errors become PANIC
-		 * errors.  See miscadmin.h.
-		 */
-		if (CritSectionCount > 0)
-			elevel = PANIC;
-
-		/*
-		 * Check reasons for treating ERROR as FATAL:
-		 *
-		 * 1. we have no handler to pass the error to (implies we are in the
-		 * postmaster or in backend startup).
-		 *
-		 * 2. ExitOnAnyError mode switch is set (initdb uses this).
-		 *
-		 * 3. the error occurred after proc_exit has begun to run.  (It's
-		 * proc_exit's responsibility to see that this doesn't turn into
-		 * infinite recursion!)
-		 */
-		if (elevel == ERROR)
-		{
-			if (PG_exception_stack == NULL ||
-				ExitOnAnyError ||
-				proc_exit_inprogress)
-				elevel = FATAL;
-		}
-
-		/*
-		 * If the error level is ERROR or more, errfinish is not going to
-		 * return to caller; therefore, if there is any stacked error already
-		 * in progress it will be lost.  This is more or less okay, except we
-		 * do not want to have a FATAL or PANIC error downgraded because the
-		 * reporting process was interrupted by a lower-grade error.  So check
-		 * the stack and make sure we panic if panic is warranted.
-		 */
-		for (i = 0; i <= errordata_stack_depth; i++)
-			elevel = Max(elevel, errordata[i].elevel);
-	}
-
-	/*
-	 * Now decide whether we need to process this report at all; if it's
-	 * warning or less and not enabled for logging, just return false without
-	 * starting up any error logging machinery.
-	 */
-
-	/* Determine whether message is enabled for server log output */
-	output_to_server = is_log_level_output(elevel, log_min_messages);
-
-	/* Determine whether message is enabled for client output */
-	if (whereToSendOutput == DestRemote && elevel != LOG_SERVER_ONLY)
-	{
-		/*
-		 * client_min_messages is honored only after we complete the
-		 * authentication handshake.  This is required both for security
-		 * reasons and because many clients can't handle NOTICE messages
-		 * during authentication.
-		 */
-		if (ClientAuthInProgress)
-			output_to_client = (elevel >= ERROR);
-		else
-			output_to_client = (elevel >= client_min_messages ||
-								elevel == INFO);
-	}
-
-	/* Skip processing effort if non-error message will not be output */
-	if (elevel < ERROR && !output_to_server && !output_to_client)
-		return false;
-
-	/*
-	 * We need to do some actual work.  Make sure that memory context
-	 * initialization has finished, else we can't do anything useful.
-	 */
-	if (ErrorContext == NULL)
-	{
-		/* Oops, hard crash time; very little we can do safely here */
-		write_stderr("error occurred before error message processing is available\n");
-		exit(2);
-	}
-
-	/*
-	 * Okay, crank up a stack entry to store the info in.
-	 */
-
-	if (recursion_depth++ > 0 && elevel >= ERROR)
-	{
-		/*
-		 * Oops, error during error processing.  Clear ErrorContext as
-		 * discussed at top of file.  We will not return to the original
-		 * error's reporter or handler, so we don't need it.
-		 */
-		MemoryContextReset(ErrorContext);
-
-		/*
-		 * Infinite error recursion might be due to something broken in a
-		 * context traceback routine.  Abandon them too.  We also abandon
-		 * attempting to print the error statement (which, if long, could
-		 * itself be the source of the recursive failure).
-		 */
-		if (in_error_recursion_trouble())
-		{
-			error_context_stack = NULL;
-			debug_query_string = NULL;
-		}
-	}
-	if (++errordata_stack_depth >= ERRORDATA_STACK_SIZE)
-	{
-		/*
-		 * Wups, stack not big enough.  We treat this as a PANIC condition
-		 * because it suggests an infinite loop of errors during error
-		 * recovery.
-		 */
-		errordata_stack_depth = -1; /* make room on stack */
-		ereport(PANIC, (errmsg_internal("ERRORDATA_STACK_SIZE exceeded")));
-	}
-
-	/* Initialize data for this error frame */
-	edata = &errordata[errordata_stack_depth];
-	MemSet(edata, 0, sizeof(ErrorData));
-	edata->elevel = elevel;
-	edata->output_to_server = output_to_server;
-	edata->output_to_client = output_to_client;
-	/* the default text domain is the backend's */
-	edata->domain = domain ? domain : PG_TEXTDOMAIN("postgres");
-	/* initialize context_domain the same way (see set_errcontext_domain()) */
-	edata->context_domain = edata->domain;
-	/* Select default errcode based on elevel */
-	if (elevel >= ERROR)
-		edata->sqlerrcode = ERRCODE_INTERNAL_ERROR;
-	else if (elevel == WARNING)
-		edata->sqlerrcode = ERRCODE_WARNING;
-	else
-		edata->sqlerrcode = ERRCODE_SUCCESSFUL_COMPLETION;
-	/* errno is saved here so that error parameter eval can't change it */
-	edata->saved_errno = errno;
-
-	/*
-	 * Any allocations for this error state level should go into ErrorContext
-	 */
-	edata->assoc_context = ErrorContext;
-
-	recursion_depth--;
-	return true;
-}
 
 /*
  * Checks whether the given funcname matches backtrace_functions; see
  * check_backtrace_functions.
  */
-static bool
-matches_backtrace_functions(const char *funcname)
-{
-	char	   *p;
 
-	if (!backtrace_symbol_list || funcname == NULL || funcname[0] == '\0')
-		return false;
-
-	p = backtrace_symbol_list;
-	for (;;)
-	{
-		if (*p == '\0')			/* end of backtrace_symbol_list */
-			break;
-
-		if (strcmp(funcname, p) == 0)
-			return true;
-		p += strlen(p) + 1;
-	}
-
-	return false;
-}
 
 /*
  * errfinish --- end an error-reporting cycle
@@ -466,183 +285,7 @@ matches_backtrace_functions(const char *funcname)
  * If elevel, as passed to errstart(), is ERROR or worse, control does not
  * return to the caller.  See elog.h for the error level definitions.
  */
-void
-errfinish(const char *filename, int lineno, const char *funcname)
-{
-	ErrorData  *edata = &errordata[errordata_stack_depth];
-	int			elevel;
-	MemoryContext oldcontext;
-	ErrorContextCallback *econtext;
 
-	recursion_depth++;
-	CHECK_STACK_DEPTH();
-
-	/* Save the last few bits of error state into the stack entry */
-	if (filename)
-	{
-		const char *slash;
-
-		/* keep only base name, useful especially for vpath builds */
-		slash = strrchr(filename, '/');
-		if (slash)
-			filename = slash + 1;
-	}
-
-	edata->filename = filename;
-	edata->lineno = lineno;
-	edata->funcname = funcname;
-
-	elevel = edata->elevel;
-
-	/*
-	 * Do processing in ErrorContext, which we hope has enough reserved space
-	 * to report an error.
-	 */
-	oldcontext = MemoryContextSwitchTo(ErrorContext);
-
-	if (!edata->backtrace &&
-		edata->funcname &&
-		backtrace_functions &&
-		matches_backtrace_functions(edata->funcname))
-		set_backtrace(edata, 2);
-
-	/*
-	 * Call any context callback functions.  Errors occurring in callback
-	 * functions will be treated as recursive errors --- this ensures we will
-	 * avoid infinite recursion (see errstart).
-	 */
-	for (econtext = error_context_stack;
-		 econtext != NULL;
-		 econtext = econtext->previous)
-		econtext->callback(econtext->arg);
-
-	/*
-	 * If ERROR (not more nor less) we pass it off to the current handler.
-	 * Printing it and popping the stack is the responsibility of the handler.
-	 */
-	if (elevel == ERROR)
-	{
-		/*
-		 * We do some minimal cleanup before longjmp'ing so that handlers can
-		 * execute in a reasonably sane state.
-		 *
-		 * Reset InterruptHoldoffCount in case we ereport'd from inside an
-		 * interrupt holdoff section.  (We assume here that no handler will
-		 * itself be inside a holdoff section.  If necessary, such a handler
-		 * could save and restore InterruptHoldoffCount for itself, but this
-		 * should make life easier for most.)
-		 */
-		InterruptHoldoffCount = 0;
-		QueryCancelHoldoffCount = 0;
-
-		CritSectionCount = 0;	/* should be unnecessary, but... */
-
-		/*
-		 * Note that we leave CurrentMemoryContext set to ErrorContext. The
-		 * handler should reset it to something else soon.
-		 */
-
-		recursion_depth--;
-		PG_RE_THROW();
-	}
-
-	/*
-	 * If we are doing FATAL or PANIC, abort any old-style COPY OUT in
-	 * progress, so that we can report the message before dying.  (Without
-	 * this, pq_putmessage will refuse to send the message at all, which is
-	 * what we want for NOTICE messages, but not for fatal exits.) This hack
-	 * is necessary because of poor design of old-style copy protocol.
-	 */
-	if (elevel >= FATAL && whereToSendOutput == DestRemote)
-		pq_endcopyout(true);
-
-	/* Emit the message to the right places */
-	EmitErrorReport();
-
-	/* Now free up subsidiary data attached to stack entry, and release it */
-	if (edata->message)
-		pfree(edata->message);
-	if (edata->detail)
-		pfree(edata->detail);
-	if (edata->detail_log)
-		pfree(edata->detail_log);
-	if (edata->hint)
-		pfree(edata->hint);
-	if (edata->context)
-		pfree(edata->context);
-	if (edata->backtrace)
-		pfree(edata->backtrace);
-	if (edata->schema_name)
-		pfree(edata->schema_name);
-	if (edata->table_name)
-		pfree(edata->table_name);
-	if (edata->column_name)
-		pfree(edata->column_name);
-	if (edata->datatype_name)
-		pfree(edata->datatype_name);
-	if (edata->constraint_name)
-		pfree(edata->constraint_name);
-	if (edata->internalquery)
-		pfree(edata->internalquery);
-
-	errordata_stack_depth--;
-
-	/* Exit error-handling context */
-	MemoryContextSwitchTo(oldcontext);
-	recursion_depth--;
-
-	/*
-	 * Perform error recovery action as specified by elevel.
-	 */
-	if (elevel == FATAL)
-	{
-		/*
-		 * For a FATAL error, we let proc_exit clean up and exit.
-		 *
-		 * If we just reported a startup failure, the client will disconnect
-		 * on receiving it, so don't send any more to the client.
-		 */
-		if (PG_exception_stack == NULL && whereToSendOutput == DestRemote)
-			whereToSendOutput = DestNone;
-
-		/*
-		 * fflush here is just to improve the odds that we get to see the
-		 * error message, in case things are so hosed that proc_exit crashes.
-		 * Any other code you might be tempted to add here should probably be
-		 * in an on_proc_exit or on_shmem_exit callback instead.
-		 */
-		fflush(stdout);
-		fflush(stderr);
-
-		/*
-		 * Do normal process-exit cleanup, then return exit code 1 to indicate
-		 * FATAL termination.  The postmaster may or may not consider this
-		 * worthy of panic, depending on which subprocess returns it.
-		 */
-		proc_exit(1);
-	}
-
-	if (elevel >= PANIC)
-	{
-		/*
-		 * Serious crash time. Postmaster will observe SIGABRT process exit
-		 * status and kill the other backends too.
-		 *
-		 * XXX: what if we are *in* the postmaster?  abort() won't kill our
-		 * children...
-		 */
-		fflush(stdout);
-		fflush(stderr);
-		abort();
-	}
-
-	/*
-	 * Check for cancel/die interrupt first --- this is so that the user can
-	 * stop a query emitting tons of notice or warning messages, even if it's
-	 * in a loop that otherwise fails to check for interrupts.
-	 */
-	CHECK_FOR_INTERRUPTS();
-}
 
 
 /*
@@ -650,18 +293,7 @@ errfinish(const char *filename, int lineno, const char *funcname)
  *
  * The code is expected to be represented as per MAKE_SQLSTATE().
  */
-int
-errcode(int sqlerrcode)
-{
-	ErrorData  *edata = &errordata[errordata_stack_depth];
 
-	/* we don't bother incrementing recursion_depth */
-	CHECK_STACK_DEPTH();
-
-	edata->sqlerrcode = sqlerrcode;
-
-	return 0;					/* return value does not matter */
-}
 
 
 /*
@@ -687,8 +319,7 @@ errcode(int sqlerrcode)
  * NOTE: the primary error message string should generally include %m
  * when this is used.
  */
-#ifdef ECONNRESET
-#endif
+
 
 
 /*
@@ -783,23 +414,7 @@ errcode(int sqlerrcode)
  * Note: no newline is needed at the end of the fmt string, since
  * ereport will provide one for the output methods that need it.
  */
-int
-errmsg(const char *fmt,...)
-{
-	ErrorData  *edata = &errordata[errordata_stack_depth];
-	MemoryContext oldcontext;
 
-	recursion_depth++;
-	CHECK_STACK_DEPTH();
-	oldcontext = MemoryContextSwitchTo(edata->assoc_context);
-
-	edata->message_id = fmt;
-	EVALUATE_MESSAGE(edata->domain, message, false, true);
-
-	MemoryContextSwitchTo(oldcontext);
-	recursion_depth--;
-	return 0;					/* return value does not matter */
-}
 
 /*
  * Add a backtrace to the containing ereport() call.  This is intended to be
@@ -813,35 +428,9 @@ errmsg(const char *fmt,...)
  * internal backtrace support functions in the backtrace.  This requires that
  * this and related functions are not inlined.
  */
-static void
-set_backtrace(ErrorData *edata, int num_skip)
-{
-	StringInfoData errtrace;
-
-	initStringInfo(&errtrace);
-
 #ifdef HAVE_BACKTRACE_SYMBOLS
-	{
-		void	   *buf[100];
-		int			nframes;
-		char	  **strfrms;
-
-		nframes = backtrace(buf, lengthof(buf));
-		strfrms = backtrace_symbols(buf, nframes);
-		if (strfrms == NULL)
-			return;
-
-		for (int i = num_skip; i < nframes; i++)
-			appendStringInfo(&errtrace, "\n%s", strfrms[i]);
-		free(strfrms);
-	}
 #else
-	appendStringInfoString(&errtrace,
-						   "backtrace generation is not supported by this installation");
 #endif
-
-	edata->backtrace = errtrace.data;
-}
 
 /*
  * errmsg_internal --- add a primary error message text to the current error
@@ -854,23 +443,7 @@ set_backtrace(ErrorData *edata, int num_skip)
  * the message because the translation would fail and result in infinite
  * error recursion.
  */
-int
-errmsg_internal(const char *fmt,...)
-{
-	ErrorData  *edata = &errordata[errordata_stack_depth];
-	MemoryContext oldcontext;
 
-	recursion_depth++;
-	CHECK_STACK_DEPTH();
-	oldcontext = MemoryContextSwitchTo(edata->assoc_context);
-
-	edata->message_id = fmt;
-	EVALUATE_MESSAGE(edata->domain, message, false, false);
-
-	MemoryContextSwitchTo(oldcontext);
-	recursion_depth--;
-	return 0;					/* return value does not matter */
-}
 
 
 /*
@@ -883,22 +456,7 @@ errmsg_internal(const char *fmt,...)
 /*
  * errdetail --- add a detail error message text to the current error
  */
-int
-errdetail(const char *fmt,...)
-{
-	ErrorData  *edata = &errordata[errordata_stack_depth];
-	MemoryContext oldcontext;
 
-	recursion_depth++;
-	CHECK_STACK_DEPTH();
-	oldcontext = MemoryContextSwitchTo(edata->assoc_context);
-
-	EVALUATE_MESSAGE(edata->domain, detail, false, true);
-
-	MemoryContextSwitchTo(oldcontext);
-	recursion_depth--;
-	return 0;					/* return value does not matter */
-}
 
 
 /*
@@ -935,22 +493,14 @@ errdetail(const char *fmt,...)
 /*
  * errhint --- add a hint error message text to the current error
  */
-int
-errhint(const char *fmt,...)
-{
-	ErrorData  *edata = &errordata[errordata_stack_depth];
-	MemoryContext oldcontext;
 
-	recursion_depth++;
-	CHECK_STACK_DEPTH();
-	oldcontext = MemoryContextSwitchTo(edata->assoc_context);
 
-	EVALUATE_MESSAGE(edata->domain, hint, false, true);
 
-	MemoryContextSwitchTo(oldcontext);
-	recursion_depth--;
-	return 0;					/* return value does not matter */
-}
+/*
+ * errhint_plural --- add a hint error message text to the current error,
+ * with support for pluralization of the message text
+ */
+
 
 
 /*
@@ -960,22 +510,7 @@ errhint(const char *fmt,...)
  * context information.  We assume earlier calls represent more-closely-nested
  * states.
  */
-int
-errcontext_msg(const char *fmt,...)
-{
-	ErrorData  *edata = &errordata[errordata_stack_depth];
-	MemoryContext oldcontext;
 
-	recursion_depth++;
-	CHECK_STACK_DEPTH();
-	oldcontext = MemoryContextSwitchTo(edata->assoc_context);
-
-	EVALUATE_MESSAGE(edata->context_domain, context, true, true);
-
-	MemoryContextSwitchTo(oldcontext);
-	recursion_depth--;
-	return 0;					/* return value does not matter */
-}
 
 /*
  * set_errcontext_domain --- set message domain to be used by errcontext()
@@ -986,19 +521,7 @@ errcontext_msg(const char *fmt,...)
  * a set_errcontext_domain() call to specify the domain.  This is usually
  * done transparently by the errcontext() macro.
  */
-int
-set_errcontext_domain(const char *domain)
-{
-	ErrorData  *edata = &errordata[errordata_stack_depth];
 
-	/* we don't bother incrementing recursion_depth */
-	CHECK_STACK_DEPTH();
-
-	/* the default text domain is the backend's */
-	edata->context_domain = domain ? domain : PG_TEXTDOMAIN("postgres");
-
-	return 0;					/* return value does not matter */
-}
 
 
 /*
@@ -1016,47 +539,15 @@ set_errcontext_domain(const char *domain)
  */
 
 
-
-/*
- * errfunction --- add reporting function name to the current error
- *
- * This is used when backwards compatibility demands that the function
- * name appear in messages sent to old-protocol clients.  Note that the
- * passed string is expected to be a non-freeable constant string.
- */
-
-
 /*
  * errposition --- add cursor position to the current error
  */
-int
-errposition(int cursorpos)
-{
-	ErrorData  *edata = &errordata[errordata_stack_depth];
 
-	/* we don't bother incrementing recursion_depth */
-	CHECK_STACK_DEPTH();
-
-	edata->cursorpos = cursorpos;
-
-	return 0;					/* return value does not matter */
-}
 
 /*
  * internalerrposition --- add internal cursor position to the current error
  */
-int
-internalerrposition(int cursorpos)
-{
-	ErrorData  *edata = &errordata[errordata_stack_depth];
 
-	/* we don't bother incrementing recursion_depth */
-	CHECK_STACK_DEPTH();
-
-	edata->internalpos = cursorpos;
-
-	return 0;					/* return value does not matter */
-}
 
 /*
  * internalerrquery --- add internal query text to the current error
@@ -1065,25 +556,7 @@ internalerrposition(int cursorpos)
  * is intended for use in error callback subroutines that are editorializing
  * on the layout of the error report.
  */
-int
-internalerrquery(const char *query)
-{
-	ErrorData  *edata = &errordata[errordata_stack_depth];
 
-	/* we don't bother incrementing recursion_depth */
-	CHECK_STACK_DEPTH();
-
-	if (edata->internalquery)
-	{
-		pfree(edata->internalquery);
-		edata->internalquery = NULL;
-	}
-
-	if (query)
-		edata->internalquery = MemoryContextStrdup(edata->assoc_context, query);
-
-	return 0;					/* return value does not matter */
-}
 
 /*
  * err_generic_string -- used to set individual ErrorData string fields
@@ -1108,16 +581,7 @@ internalerrquery(const char *query)
  * This is only intended for use in error callback subroutines, since there
  * is no other place outside elog.c where the concept is meaningful.
  */
-int
-geterrcode(void)
-{
-	ErrorData  *edata = &errordata[errordata_stack_depth];
 
-	/* we don't bother incrementing recursion_depth */
-	CHECK_STACK_DEPTH();
-
-	return edata->sqlerrcode;
-}
 
 /*
  * geterrposition --- return the currently set error position (0 if none)
@@ -1125,16 +589,7 @@ geterrcode(void)
  * This is only intended for use in error callback subroutines, since there
  * is no other place outside elog.c where the concept is meaningful.
  */
-int
-geterrposition(void)
-{
-	ErrorData  *edata = &errordata[errordata_stack_depth];
 
-	/* we don't bother incrementing recursion_depth */
-	CHECK_STACK_DEPTH();
-
-	return edata->cursorpos;
-}
 
 /*
  * getinternalerrposition --- same for internal error position
@@ -1142,16 +597,7 @@ geterrposition(void)
  * This is only intended for use in error callback subroutines, since there
  * is no other place outside elog.c where the concept is meaningful.
  */
-int
-getinternalerrposition(void)
-{
-	ErrorData  *edata = &errordata[errordata_stack_depth];
 
-	/* we don't bother incrementing recursion_depth */
-	CHECK_STACK_DEPTH();
-
-	return edata->internalpos;
-}
 
 
 /*
@@ -1187,49 +633,7 @@ getinternalerrposition(void)
  * if the error is caught by somebody).  For all other severity levels this
  * is called by errfinish.
  */
-void
-EmitErrorReport(void)
-{
-	ErrorData  *edata = &errordata[errordata_stack_depth];
-	MemoryContext oldcontext;
 
-	recursion_depth++;
-	CHECK_STACK_DEPTH();
-	oldcontext = MemoryContextSwitchTo(edata->assoc_context);
-
-	/*
-	 * Call hook before sending message to log.  The hook function is allowed
-	 * to turn off edata->output_to_server, so we must recheck that afterward.
-	 * Making any other change in the content of edata is not considered
-	 * supported.
-	 *
-	 * Note: the reason why the hook can only turn off output_to_server, and
-	 * not turn it on, is that it'd be unreliable: we will never get here at
-	 * all if errstart() deems the message uninteresting.  A hook that could
-	 * make decisions in that direction would have to hook into errstart(),
-	 * where it would have much less information available.  emit_log_hook is
-	 * intended for custom log filtering and custom log message transmission
-	 * mechanisms.
-	 *
-	 * The log hook has access to both the translated and original English
-	 * error message text, which is passed through to allow it to be used as a
-	 * message identifier. Note that the original text is not available for
-	 * detail, detail_log, hint and context text elements.
-	 */
-	if (edata->output_to_server && emit_log_hook)
-		(*emit_log_hook) (edata);
-
-	/* Send to server log, if enabled */
-	if (edata->output_to_server)
-		send_message_to_server_log(edata);
-
-	/* Send to client, if enabled */
-	if (edata->output_to_client)
-		send_message_to_frontend(edata);
-
-	MemoryContextSwitchTo(oldcontext);
-	recursion_depth--;
-}
 
 /*
  * CopyErrorData --- obtain a copy of the topmost error stack entry
@@ -1344,55 +748,7 @@ FlushErrorState(void)
 /*
  * pg_re_throw --- out-of-line implementation of PG_RE_THROW() macro
  */
-void
-pg_re_throw(void)
-{
-	/* If possible, throw the error to the next outer setjmp handler */
-	if (PG_exception_stack != NULL)
-		siglongjmp(*PG_exception_stack, 1);
-	else
-	{
-		/*
-		 * If we get here, elog(ERROR) was thrown inside a PG_TRY block, which
-		 * we have now exited only to discover that there is no outer setjmp
-		 * handler to pass the error to.  Had the error been thrown outside
-		 * the block to begin with, we'd have promoted the error to FATAL, so
-		 * the correct behavior is to make it FATAL now; that is, emit it and
-		 * then call proc_exit.
-		 */
-		ErrorData  *edata = &errordata[errordata_stack_depth];
 
-		Assert(errordata_stack_depth >= 0);
-		Assert(edata->elevel == ERROR);
-		edata->elevel = FATAL;
-
-		/*
-		 * At least in principle, the increase in severity could have changed
-		 * where-to-output decisions, so recalculate.  This should stay in
-		 * sync with errstart(), which see for comments.
-		 */
-		if (IsPostmasterEnvironment)
-			edata->output_to_server = is_log_level_output(FATAL,
-														  log_min_messages);
-		else
-			edata->output_to_server = (FATAL >= log_min_messages);
-		if (whereToSendOutput == DestRemote)
-			edata->output_to_client = true;
-
-		/*
-		 * We can use errfinish() for the rest, but we don't want it to call
-		 * any error context routines a second time.  Since we know we are
-		 * about to exit, it should be OK to just clear the context stack.
-		 */
-		error_context_stack = NULL;
-
-		errfinish(edata->filename, edata->lineno, edata->funcname);
-	}
-
-	/* Doesn't return ... */
-	ExceptionalCondition("pg_re_throw tried to return", "FailedAssertion",
-						 __FILE__, __LINE__);
-}
 
 
 /*
@@ -1481,6 +837,7 @@ write_eventlog(int level, const char *line, int len)
 			eventlevel = EVENTLOG_INFORMATION_TYPE;
 			break;
 		case WARNING:
+		case WARNING_CLIENT_ONLY:
 			eventlevel = EVENTLOG_WARNING_TYPE;
 			break;
 		case ERROR:
@@ -1663,72 +1020,12 @@ static void send_message_to_frontend(ErrorData *edata) {}
  * not available). Used before ereport/elog can be used
  * safely (memory context, GUC load etc)
  */
-void
-write_stderr(const char *fmt,...)
-{
-	va_list		ap;
-
 #ifdef WIN32
-	char		errbuf[2048];	/* Arbitrary size? */
 #endif
-
-	fmt = _(fmt);
-
-	va_start(ap, fmt);
 #ifndef WIN32
-	/* On Unix, we just fprintf to stderr */
-	vfprintf(stderr, fmt, ap);
-	fflush(stderr);
 #else
-	vsnprintf(errbuf, sizeof(errbuf), fmt, ap);
-
-	/*
-	 * On Win32, we print to stderr if running on a console, or write to
-	 * eventlog if running as a service
-	 */
-	if (pgwin32_is_service())	/* Running as a service */
-	{
-		write_eventlog(ERROR, errbuf, strlen(errbuf));
-	}
-	else
-	{
-		/* Not running as service, write to stderr */
-		write_console(errbuf, strlen(errbuf));
-		fflush(stderr);
-	}
 #endif
-	va_end(ap);
-}
 
-
-/*
- * is_log_level_output -- is elevel logically >= log_min_level?
- *
- * We use this for tests that should consider LOG to sort out-of-order,
- * between ERROR and FATAL.  Generally this is the right thing for testing
- * whether a message should go to the postmaster log, whereas a simple >=
- * test is correct for testing whether the message should go to the client.
- */
-static bool
-is_log_level_output(int elevel, int log_min_level)
-{
-	if (elevel == LOG || elevel == LOG_SERVER_ONLY)
-	{
-		if (log_min_level == LOG || log_min_level <= ERROR)
-			return true;
-	}
-	else if (log_min_level == LOG)
-	{
-		/* elevel != LOG */
-		if (elevel >= FATAL)
-			return true;
-	}
-	/* Neither is LOG */
-	else if (elevel >= log_min_level)
-		return true;
-
-	return false;
-}
 
 /*
  * Adjust the level of a recovery-related message per trace_recovery_messages.

@@ -1,21 +1,5 @@
 /*--------------------------------------------------------------------
  * Symbols referenced in this file:
- * - pg_mbcliplen
- * - pg_encoding_mbcliplen
- * - cliplen
- * - DatabaseEncoding
- * - pg_verifymbstr
- * - pg_verify_mbstr_len
- * - report_invalid_encoding
- * - GetDatabaseEncoding
- * - pg_get_client_encoding
- * - ClientEncoding
- * - pg_database_encoding_max_length
- * - pg_unicode_to_server
- * - GetDatabaseEncodingName
- * - Utf8ToServerConvProc
- * - pg_mbstrlen_with_len
- * - pg_mblen
  * - SetDatabaseEncoding
  *--------------------------------------------------------------------
  */
@@ -45,7 +29,7 @@
  * the result is validly encoded according to the destination encoding.
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -94,15 +78,12 @@ typedef struct ConvProcInfo
  * to the server encoding.  It's NULL if the server encoding *is* UTF-8,
  * or if we lack a conversion function for this.
  */
-static __thread FmgrInfo *Utf8ToServerConvProc = NULL;
 
 
 /*
  * These variables track the currently-selected encodings.
  */
-static __thread const pg_enc2name *ClientEncoding = &pg_enc2name_tbl[PG_SQL_ASCII];
 
-static __thread const pg_enc2name *DatabaseEncoding = &pg_enc2name_tbl[PG_SQL_ASCII];
 
 
 
@@ -150,11 +131,7 @@ static int	cliplen(const char *str, int len, int limit);
 /*
  * returns the current client encoding
  */
-int
-pg_get_client_encoding(void)
-{
-	return ClientEncoding->encoding;
-}
+
 
 /*
  * returns the current client encoding name
@@ -165,6 +142,37 @@ pg_get_client_encoding(void)
  * Convert src string to another encoding (general case).
  *
  * See the notes about string conversion functions at the top of this file.
+ */
+
+
+/*
+ * Convert src string to another encoding.
+ *
+ * This function has a different API than the other conversion functions.
+ * The caller should've looked up the conversion function using
+ * FindDefaultConversionProc().  Unlike the other functions, the converted
+ * result is not palloc'd.  It is written to the caller-supplied buffer
+ * instead.
+ *
+ * src_encoding   - encoding to convert from
+ * dest_encoding  - encoding to convert to
+ * src, srclen    - input buffer and its length in bytes
+ * dest, destlen  - destination buffer and its size in bytes
+ *
+ * The output is null-terminated.
+ *
+ * If destlen < srclen * MAX_CONVERSION_LENGTH + 1, the converted output
+ * wouldn't necessarily fit in the output buffer, and the function will not
+ * convert the whole input.
+ *
+ * TODO: The conversion function interface is not great.  Firstly, it
+ * would be nice to pass through the destination buffer size to the
+ * conversion function, so that if you pass a shorter destination buffer, it
+ * could still continue to fill up the whole buffer.  Currently, we have to
+ * assume worst case expansion and stop the conversion short, even if there
+ * is in fact space left in the destination buffer.  Secondly, it would be
+ * nice to return the number of bytes written to the caller, to avoid a call
+ * to strlen().
  */
 
 
@@ -258,60 +266,7 @@ pg_get_client_encoding(void)
  * conversion function.  That's partly for speed but mostly because the parser
  * may call this outside any transaction, or in an aborted transaction.
  */
-void
-pg_unicode_to_server(pg_wchar c, unsigned char *s)
-{
-	unsigned char c_as_utf8[MAX_MULTIBYTE_CHAR_LEN + 1];
-	int			c_as_utf8_len;
-	int			server_encoding;
 
-	/*
-	 * Complain if invalid Unicode code point.  The choice of errcode here is
-	 * debatable, but really our caller should have checked this anyway.
-	 */
-	if (!is_valid_unicode_codepoint(c))
-		ereport(ERROR,
-				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("invalid Unicode code point")));
-
-	/* Otherwise, if it's in ASCII range, conversion is trivial */
-	if (c <= 0x7F)
-	{
-		s[0] = (unsigned char) c;
-		s[1] = '\0';
-		return;
-	}
-
-	/* If the server encoding is UTF-8, we just need to reformat the code */
-	server_encoding = GetDatabaseEncoding();
-	if (server_encoding == PG_UTF8)
-	{
-		unicode_to_utf8(c, s);
-		s[pg_utf_mblen(s)] = '\0';
-		return;
-	}
-
-	/* For all other cases, we must have a conversion function available */
-	if (Utf8ToServerConvProc == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("conversion between %s and %s is not supported",
-						pg_enc2name_tbl[PG_UTF8].name,
-						GetDatabaseEncodingName())));
-
-	/* Construct UTF-8 source string */
-	unicode_to_utf8(c, c_as_utf8);
-	c_as_utf8_len = pg_utf_mblen(c_as_utf8);
-	c_as_utf8[c_as_utf8_len] = '\0';
-
-	/* Convert, or throw error if we can't */
-	FunctionCall5(Utf8ToServerConvProc,
-				  Int32GetDatum(PG_UTF8),
-				  Int32GetDatum(server_encoding),
-				  CStringGetDatum(c_as_utf8),
-				  CStringGetDatum(s),
-				  Int32GetDatum(c_as_utf8_len));
-}
 
 
 /* convert a multibyte string to a wchar */
@@ -333,11 +288,7 @@ pg_unicode_to_server(pg_wchar c, unsigned char *s)
 
 
 /* returns the byte length of a multibyte character */
-int
-pg_mblen(const char *mbstr)
-{
-	return pg_wchar_table[DatabaseEncoding->encoding].mblen((const unsigned char *) mbstr);
-}
+
 
 /* returns the display length of a multibyte character */
 
@@ -348,25 +299,7 @@ pg_mblen(const char *mbstr)
 /* returns the length (counted in wchars) of a multibyte string
  * (not necessarily NULL terminated)
  */
-int
-pg_mbstrlen_with_len(const char *mbstr, int limit)
-{
-	int			len = 0;
 
-	/* optimization for single byte encoding */
-	if (pg_database_encoding_max_length() == 1)
-		return limit;
-
-	while (limit > 0 && *mbstr)
-	{
-		int			l = pg_mblen(mbstr);
-
-		limit -= l;
-		mbstr += l;
-		len++;
-	}
-	return len;
-}
 
 /*
  * returns the byte length of a multibyte string
@@ -374,43 +307,12 @@ pg_mbstrlen_with_len(const char *mbstr, int limit)
  * that is no longer than limit.
  * this function does not break multibyte character boundary.
  */
-int
-pg_mbcliplen(const char *mbstr, int len, int limit)
-{
-	return pg_encoding_mbcliplen(DatabaseEncoding->encoding, mbstr,
-								 len, limit);
-}
+
 
 /*
  * pg_mbcliplen with specified encoding
  */
-int
-pg_encoding_mbcliplen(int encoding, const char *mbstr,
-					  int len, int limit)
-{
-	mblen_converter mblen_fn;
-	int			clen = 0;
-	int			l;
 
-	/* optimization for single byte encoding */
-	if (pg_encoding_max_length(encoding) == 1)
-		return cliplen(mbstr, len, limit);
-
-	mblen_fn = pg_wchar_table[encoding].mblen;
-
-	while (len > 0 && *mbstr)
-	{
-		l = (*mblen_fn) ((const unsigned char *) mbstr);
-		if ((clen + l) > limit)
-			break;
-		clen += l;
-		if (clen == limit)
-			break;
-		len -= l;
-		mbstr += l;
-	}
-	return clen;
-}
 
 /*
  * Similar to pg_mbcliplen except the limit parameter specifies the
@@ -419,16 +321,7 @@ pg_encoding_mbcliplen(int encoding, const char *mbstr,
 
 
 /* mbcliplen for any single-byte encoding */
-static int
-cliplen(const char *str, int len, int limit)
-{
-	int			l = 0;
 
-	len = Min(len, limit);
-	while (l < len && str[l])
-		l++;
-	return l;
-}
 
 void
 SetDatabaseEncoding(int encoding)
@@ -528,17 +421,9 @@ pg_bind_textdomain_codeset(const char *domainname)
  * encoding of data stored in text-like data types.  Affected types include
  * cstring, text, varchar, name, xml, and json.
  */
-int
-GetDatabaseEncoding(void)
-{
-	return DatabaseEncoding->encoding;
-}
 
-const char *
-GetDatabaseEncodingName(void)
-{
-	return DatabaseEncoding->name;
-}
+
+
 
 
 
@@ -616,22 +501,13 @@ GetDatabaseEncodingName(void)
 /*
  * fetch maximum length of the encoding for the current database
  */
-int
-pg_database_encoding_max_length(void)
-{
-	return pg_wchar_table[GetDatabaseEncoding()].maxmblen;
-}
+
 
 /*
  * Verify mbstr to make sure that it is validly encoded in the current
  * database encoding.  Otherwise same as pg_verify_mbstr().
  */
-bool
-pg_verifymbstr(const char *mbstr, int len, bool noError)
-{
-	return
-		pg_verify_mbstr_len(GetDatabaseEncoding(), mbstr, len, noError) >= 0;
-}
+
 
 /*
  * Verify mbstr to make sure that it is validly encoded in the specified
@@ -649,68 +525,11 @@ pg_verifymbstr(const char *mbstr, int len, bool noError)
  * If OK, return length of string in the encoding.
  * If a problem is found, return -1 when noError is
  * true; when noError is false, ereport() a descriptive message.
+ *
+ * Note: We cannot use the faster encoding-specific mbverifystr() function
+ * here, because we need to count the number of characters in the string.
  */
-int
-pg_verify_mbstr_len(int encoding, const char *mbstr, int len, bool noError)
-{
-	mbverifier	mbverify;
-	int			mb_len;
 
-	Assert(PG_VALID_ENCODING(encoding));
-
-	/*
-	 * In single-byte encodings, we need only reject nulls (\0).
-	 */
-	if (pg_encoding_max_length(encoding) <= 1)
-	{
-		const char *nullpos = memchr(mbstr, 0, len);
-
-		if (nullpos == NULL)
-			return len;
-		if (noError)
-			return -1;
-		report_invalid_encoding(encoding, nullpos, 1);
-	}
-
-	/* fetch function pointer just once */
-	mbverify = pg_wchar_table[encoding].mbverify;
-
-	mb_len = 0;
-
-	while (len > 0)
-	{
-		int			l;
-
-		/* fast path for ASCII-subset characters */
-		if (!IS_HIGHBIT_SET(*mbstr))
-		{
-			if (*mbstr != '\0')
-			{
-				mb_len++;
-				mbstr++;
-				len--;
-				continue;
-			}
-			if (noError)
-				return -1;
-			report_invalid_encoding(encoding, mbstr, len);
-		}
-
-		l = (*mbverify) ((const unsigned char *) mbstr, len);
-
-		if (l < 0)
-		{
-			if (noError)
-				return -1;
-			report_invalid_encoding(encoding, mbstr, len);
-		}
-
-		mbstr += l;
-		len -= l;
-		mb_len++;
-	}
-	return mb_len;
-}
 
 /*
  * check_encoding_conversion_args: check arguments of a conversion function
@@ -730,31 +549,7 @@ pg_verify_mbstr_len(int encoding, const char *mbstr, int len, bool noError)
  * note: len is remaining length of string, not length of character;
  * len must be greater than zero, as we always examine the first byte.
  */
-void
-report_invalid_encoding(int encoding, const char *mbstr, int len)
-{
-	int			l = pg_encoding_mblen(encoding, mbstr);
-	char		buf[8 * 5 + 1];
-	char	   *p = buf;
-	int			j,
-				jlimit;
 
-	jlimit = Min(l, len);
-	jlimit = Min(jlimit, 8);	/* prevent buffer overrun */
-
-	for (j = 0; j < jlimit; j++)
-	{
-		p += sprintf(p, "0x%02x", (unsigned char) mbstr[j]);
-		if (j < jlimit - 1)
-			p += sprintf(p, " ");
-	}
-
-	ereport(ERROR,
-			(errcode(ERRCODE_CHARACTER_NOT_IN_REPERTOIRE),
-			 errmsg("invalid byte sequence for encoding \"%s\": %s",
-					pg_enc2name_tbl[encoding].name,
-					buf)));
-}
 
 /*
  * report_untranslatable_char: complain about untranslatable character
