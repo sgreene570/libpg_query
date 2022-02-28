@@ -7,6 +7,7 @@
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_trigger.h"
+#include "commands/defrem.h"
 #include "commands/trigger.h"
 #include "common/keywords.h"
 #include "common/kwlookup.h"
@@ -2647,24 +2648,6 @@ static void deparseAExpr(StringInfo str, A_Expr* a_expr, DeparseNodeContext cont
 			deparseExpr(str, a_expr->rexpr);
 			appendStringInfoChar(str, ')');
 			return;
-		case AEXPR_OF: /* IS [NOT] OF - name must be "=" or "<>" */
-			Assert(list_length(a_expr->name) == 1);
-			Assert(IsA(linitial(a_expr->name), String));
-			Assert(IsA(a_expr->rexpr, List));
-			deparseExpr(str, a_expr->lexpr);
-			appendStringInfoChar(str, ' ');
-			name = ((Value *) linitial(a_expr->name))->val.str;
-			if (strcmp(name, "=") == 0) {
-				appendStringInfoString(str, "IS OF ");
-			} else if (strcmp(name, "<>") == 0) {
-				appendStringInfoString(str, "IS NOT OF ");
-			} else {
-				Assert(false);
-			}
-			appendStringInfoChar(str, '(');
-			deparseTypeList(str, castNode(List, a_expr->rexpr));
-			appendStringInfoChar(str, ')');
-			return;
 		case AEXPR_IN: /* [NOT] IN - name must be "=" or "<>" */
 			Assert(list_length(a_expr->name) == 1);
 			Assert(IsA(linitial(a_expr->name), String));
@@ -2767,10 +2750,6 @@ static void deparseAExpr(StringInfo str, A_Expr* a_expr, DeparseNodeContext cont
 				if (lnext(castNode(List, a_expr->rexpr), lc))
 					appendStringInfoString(str, " AND ");
 			}
-			return;
-		case AEXPR_PAREN: /* nameless dummy node for parentheses */
-			// Not present in parse trees when operator_precedence_warning is turned off
-			Assert(false);
 			return;
 	}
 }
@@ -5066,7 +5045,7 @@ static void deparseCreateTableAsStmt(StringInfo str, CreateTableAsStmt *create_t
 
 	deparseOptTemp(str, create_table_as_stmt->into->rel->relpersistence);
 
-	switch (create_table_as_stmt->relkind)
+	switch (create_table_as_stmt->objtype)
 	{
 		case OBJECT_TABLE:
 			appendStringInfoString(str, "TABLE ");
@@ -5945,7 +5924,7 @@ static void deparseAlterTableStmt(StringInfo str, AlterTableStmt *alter_table_st
 
 	appendStringInfoString(str, "ALTER ");
 
-	switch (alter_table_stmt->relkind)
+	switch (alter_table_stmt->objtype)
 	{
 		case OBJECT_TABLE:
 			appendStringInfoString(str, "TABLE ");
@@ -7823,7 +7802,22 @@ static void deparseReindexStmt(StringInfo str, ReindexStmt *reindex_stmt)
 {
 	appendStringInfoString(str, "REINDEX ");
 
-	if (reindex_stmt->options & REINDEXOPT_VERBOSE)
+	ListCell   *lc;
+	bool		concurrently = false;
+	bool		verbose = false;
+
+	/* Parse option list */
+	foreach(lc, reindex_stmt->params)
+	{
+		DefElem    *opt = (DefElem *) lfirst(lc);
+
+		if (strcmp(opt->defname, "verbose") == 0)
+			verbose = defGetBoolean(opt);
+		else if (strcmp(opt->defname, "concurrently") == 0)
+			concurrently = defGetBoolean(opt);
+	}
+
+	if (verbose)
 		appendStringInfoString(str, "(VERBOSE) ");
 
 	switch (reindex_stmt->kind)
@@ -7845,7 +7839,7 @@ static void deparseReindexStmt(StringInfo str, ReindexStmt *reindex_stmt)
 			break;
 	}
 
-	if (reindex_stmt->concurrent)
+	if (concurrently)
 		appendStringInfoString(str, "CONCURRENTLY ");
 
 	if (reindex_stmt->relation != NULL)
@@ -8810,7 +8804,7 @@ static void deparseAlterSubscriptionStmt(StringInfo str, AlterSubscriptionStmt *
 			appendStringInfoString(str, "REFRESH PUBLICATION ");
 			deparseOptDefinition(str, alter_subscription_stmt->options);
 			break;
-		case ALTER_SUBSCRIPTION_PUBLICATION:
+		case ALTER_SUBSCRIPTION_SET_PUBLICATION:
 			appendStringInfoString(str, "SET PUBLICATION ");
 			foreach(lc, alter_subscription_stmt->publication)
 			{
@@ -9370,8 +9364,21 @@ static void deparseGroupingFunc(StringInfo str, GroupingFunc *grouping_func)
 
 static void deparseClusterStmt(StringInfo str, ClusterStmt *cluster_stmt)
 {
+	ListCell   *lc;
+	bool		concurrently = false;
+	bool		verbose = false;
+
+	/* Parse option list */
+	foreach(lc, cluster_stmt->params)
+	{
+		DefElem    *opt = (DefElem *) lfirst(lc);
+
+		if (strcmp(opt->defname, "verbose") == 0)
+			verbose = defGetBoolean(opt);
+	}
+
 	appendStringInfoString(str, "CLUSTER ");
-	if (cluster_stmt->options & CLUOPT_VERBOSE)
+	if (verbose)
 		appendStringInfoString(str, "VERBOSE ");
 
 	if (cluster_stmt->relation != NULL)
